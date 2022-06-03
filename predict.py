@@ -1,27 +1,22 @@
 # Prediction interface for Cog ⚙️
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
-import sys
-
 from cog import BasePredictor
-
-sys.path.append(".")
-sys.path.append("./taming-transformers")
-import argparse
-import gc
-import os
-import sys
-
-import numpy as np
-import open_clip
+import cog
 import torch
+from omegaconf import OmegaConf
+
+import argparse
+import os
+import numpy as np
+from PIL import Image
 from einops import rearrange
+from torchvision.utils import make_grid
+import gc
+from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from ldm.util import instantiate_from_config
-from omegaconf import OmegaConf
-from PIL import Image
-from torchvision.utils import make_grid
+import open_clip
 
 
 class Predictor(BasePredictor):
@@ -48,7 +43,9 @@ class Predictor(BasePredictor):
             model.eval()
             return model
 
-        config = OmegaConf.load("configs/latent-diffusion/txt2img-1p4B-eval.yaml")
+        config = OmegaConf.load(
+            "/latent-diffusion/configs/latent-diffusion/txt2img-1p4B-eval.yaml"
+        )
         model = load_model_from_config(config, "/content/models/ldm-model.ckpt")
 
         device = (
@@ -58,33 +55,34 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        # input: Path = Input(description="Grayscale input image"),
-        # scale: float = Input(
-        #     description="Factor to scale image by", ge=0, le=10, default=1.5
-        # ),
-        Prompt="Abstract geometric Chihuahua",
-        Steps=100,
-        ETA=1,
-        Iterations=1,
-        Samples_in_parallel=4,
-        Diversity_scale=10.0,
-        PLMS_sampling=True,
-        output_path="/content",
-        Width=256,
-        Height=256,
+        Prompt: str = cog.Input(description="Your text prompt.", default=""),
+        Steps: int = cog.Input(
+            description="Number of steps to run the model", default=100
+        ),
+        ETA: int = cog.Input(description="Can be 0 or 1", default=1),
+        Samples_in_parallel: int = cog.Input(description="Batch size", default=4),
+        Diversity_scale: float = cog.Input(
+            description="As a rule of thumb, higher values of scale produce better samples at the cost of a reduced output diversity.",
+            default=10.0,
+        ),
+        Width: int = cog.Input(description="Width", default=256),
+        Height: int = cog.Input(description="Height", default=256),
     ) -> None:
         """Run a single prediction on the model"""
         Prompts = Prompt
-        os.makedirs(output_path, exist_ok=True)
+
+        Iterations = 1
+        output_path = "/outputs"
+        PLMS_sampling = True
 
         os.system(f"rm -rf /content/steps")
         os.system(f"mkdir -p /content/steps")
 
-        frame_id = 0
+        frames = []
 
         def save_img_callback(pred_x0, i):
-            global frame_id
             # print(pred_x0)
+            frame_id = len(frames)
             x_samples_ddim = self.model.decode_first_stage(pred_x0)
             imgs = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
             grid = imgs
@@ -101,7 +99,7 @@ class Predictor(BasePredictor):
             if frame_id % 10 == 0:
                 progress_out = os.path.join(output_path, "aaa_progress.png")
                 Image.fromarray(grid.astype(np.uint8)).save(progress_out)
-            frame_id += 1
+            frames.append(frame_id)
 
         def run(opt):
             torch.cuda.empty_cache()
