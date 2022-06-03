@@ -17,12 +17,11 @@ jobs:
         with:
           python-version: 3.9
 
-      - name: Install dependencies with pipenv
-        # run: |
-        #   pip install ."[test]"
-      - run: isort --diff .
-      - run: black --check .
-      - run: flake8
+      - name: linting
+        run: |
+          isort --diff .
+          black --check .
+          flake8
       # - run: pytest --cov --cov-fail-under=80
 
   docker-image:
