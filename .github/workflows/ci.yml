@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: Build docker image
-        run: docker build . -t image:test
+        run: cog build -t image:test
 
       # - name: Smoke test docker image
       #   run: |

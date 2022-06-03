@@ -1,22 +1,22 @@
 # Prediction interface for Cog ⚙️
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
-from cog import BasePredictor
-import cog
-import torch
-from omegaconf import OmegaConf
-
 import argparse
-import os
-import numpy as np
-from PIL import Image
-from einops import rearrange
-from torchvision.utils import make_grid
 import gc
-from ldm.util import instantiate_from_config
+import os
+
+import cog
+import numpy as np
+import open_clip
+import torch
+from cog import BasePredictor
+from einops import rearrange
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-import open_clip
+from ldm.util import instantiate_from_config
+from omegaconf import OmegaConf
+from PIL import Image
+from torchvision.utils import make_grid
 
 
 class Predictor(BasePredictor):
