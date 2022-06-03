@@ -16,6 +16,9 @@ jobs:
         uses: actions/setup-python@v1
         with:
           python-version: 3.9
+      
+      - name: Install linters
+        run: pip install black flake8 isort
 
       - name: linting
         run: |
@@ -28,6 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+
+      - name: Install cog
+        run: |
+          curl -o /usr/local/bin/cog -L https://github.com/replicate/cog/releases/latest/download/cog_`uname -s`_`uname -m`
+          chmod +x /usr/local/bin/cog
 
       - name: Build docker image
         run: cog build -t image:test
