@@ -20,12 +20,12 @@ jobs:
       - name: Install linters
         run: pip install black flake8 isort
 
-      - name: linting
-        run: |
-          isort --diff .
-          black --check .
-          flake8
-      # - run: pytest --cov --cov-fail-under=80
+      # - name: linting
+      #   run: |
+      #     isort --diff .
+      #     black --check .
+      #     flake8
+      # # - run: pytest --cov --cov-fail-under=80
 
   docker-image:
     runs-on: ubuntu-latest
@@ -65,3 +65,22 @@ jobs:
         run: |
           docker tag image:test $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker inspect image:test > inspect.json
+          python .github/workflows/extract_openapi.py
+          
+      - uses: webfactory/ssh-agent@v0.5.4
+        with:
+            ssh-private-key: ${{ secrets.SSH_KEY }}
+      - name: Update model registry
+        env:
+          ECR_REGISTRY: 614871946825.dkr.ecr.us-east-1.amazonaws.com #${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ github.repository }}
+          IMAGE_TAG: latest
+        run: |
+          git config --global user.email "ci@pollinations.ai"
+          git config --global user.name "pollinations-ci"
+          git clone git@github.com:pollinations/model-index.git
+          cd model-index && python add_image.py ${{ github.repository }} $ECR_REGISTRY/$ECR_REPOSITORY && cd ..
+          mkdir -p  model-index/${{ github.repository }}
+          cp openapi.json model-index/${{ github.repository }}/openapi.json
+          cd model-index && git add . && (git commit -m "Updated ${{ github.repository }}: ${{ github.event.head_commit.message }}" && git push) || echo "model index not updated"
