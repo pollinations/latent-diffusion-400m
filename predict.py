@@ -9,7 +9,8 @@ from typing import List
 
 import numpy as np
 import torch
-from clip_retrieval.clip_back import load_index
+from clip_retrieval.clip_back import (ParquetMetadataProvider, load_index,
+                                      meta_to_dict)
 from cog import BasePredictor, Input, Path
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
@@ -65,13 +66,36 @@ def load_model_from_config(config, ckpt, verbose=False):
     model.eval()
     return model
 
+# '["similarity","hash","punsafe","pwatermark","aesthetic","LANGUAGE"]
+def map_to_metadata(
+    indices, distances, num_images, metadata_provider, columns_to_return=["url"]
+):
+    results = []
+    # metas = metadata_provider.get(indices[:num_images], columns_to_return)
+    metas = metadata_provider.get(indices[:num_images])
+    for key, (dist, ind) in enumerate(zip(distances, indices)):
+        output = {}
+        meta = None if key + 1 > len(metas) else metas[key]
+        # convert_metadata_to_base64(meta) # TODO
+        if meta is not None:
+            output.update(meta_to_dict(meta))
+        output["id"] = ind.item()
+        output["similarity"] = dist.item()
+        print(output)
+        results.append(output)
+    print(len(results))
+    return results
+
 
 # TODO
 image_index_path = "data/rdm/searchers/LAION_Aesthetic_index/image.index"
+parquet_folder = "data/rdm/searchers/LAION_Aesthetic_index/other_metadata/"
 
 
 class Predictor(BasePredictor):
     def setup(self):
+        self.outdir = Path(tempfile.mkdtemp())
+
         self.device = (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
@@ -83,9 +107,12 @@ class Predictor(BasePredictor):
         self.image_index = load_index(
             image_index_path, enable_faiss_memory_mapping=True
         )
-        print(f"Loaded clip-retrieval faiss index at {self.image_index}")
+        print(f"Loaded clip-retrieval faiss index at {image_index_path}")
 
-        self.outdir = Path(tempfile.mkdtemp())
+        self.metadata_provider = ParquetMetadataProvider(parquet_folder)
+
+        print(f"Loaded parquet metadata provider at {self.metadata_provider}")
+
         config = OmegaConf.load(f"configs/retrieval-augmented-diffusion/768x768.yaml")
         model = load_model_from_config(config, f"models/rdm/rdm768x768/model.ckpt")
         self.model = model.to(self.device)
@@ -100,19 +127,19 @@ class Predictor(BasePredictor):
         distances, indices, embeddings = self.image_index.search_and_reconstruct(
             query, num_results
         )
-        print(f"results shape: {indices.shape}")
         results = indices[0]  # first element is a list of indices
-
         nb_results = np.where(results == -1)[0]
         if len(nb_results) > 0:
             nb_results = nb_results[0]
         else:
             nb_results = len(results)
+        result_indices = results[:nb_results]
+        result_distances = distances[0][:nb_results]
         result_embeddings = embeddings[0][:nb_results]
         result_embeddings = torch.from_numpy(result_embeddings.astype("float32"))
         result_embeddings /= result_embeddings.norm(dim=-1, keepdim=True)
         result_embeddings = result_embeddings.unsqueeze(0)
-        return result_embeddings
+        return result_distances, result_indices, result_embeddings
 
     @torch.inference_mode()
     def predict(
@@ -120,6 +147,10 @@ class Predictor(BasePredictor):
         prompt: str = Input(
             default="",
             description="model will try to generate this text.",
+        ),
+        prompt_scale: float = Input(
+            default=5.0,
+            description="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
         ),
         num_lookup_images: int = Input(
             default=1,
@@ -132,24 +163,30 @@ class Predictor(BasePredictor):
             description="how many times to repeat the query",  # TODO
         ),
         height: int = Input(default=768, description="image height, in pixel space"),
-        widht: int = Input(default=768, description="image width, in pixel space"),
+        width: int = Input(default=768, description="image width, in pixel space"),
         steps: int = Input(
-            default=50,
+            default=250,
             description="how many steps to run the model for",
         ),
-        scale: float = Input(
-            default=5.0,
-            description="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
-        ),
     ) -> List[Path]:
-        clip_text_features = encode_text_with_clip_model(
+        prompt_embedding = encode_text_with_clip_model(
             text=prompt, clip_model=self.clip_model, normalize=True
         )
-        result_embeddings = self.knn_search(clip_text_features, num_lookup_images)
+        knn_distances, knn_indices, knn_embeddings = self.knn_search(
+            prompt_embedding, num_lookup_images
+        )
+        relevant_metadata = map_to_metadata(
+            indices=knn_indices,
+            distances=knn_distances,
+            num_images=num_lookup_images,
+            metadata_provider=self.metadata_provider,
+        )
+        print(relevant_metadata)
+
         sample_conditioning = torch.cat(
             [
-                clip_text_features.to(self.device),
-                result_embeddings.to(self.device),
+                prompt_embedding.to(self.device),
+                knn_embeddings.to(self.device),
             ],
             dim=1,
         )
@@ -158,13 +195,13 @@ class Predictor(BasePredictor):
                 sample_conditioning, "1 k d -> b k d", b=num_generations
             )
         uncond_clip_embed = None
-        if scale != 1.0:
+        if prompt_scale != 1.0:
             uncond_clip_embed = torch.zeros_like(sample_conditioning)
         with self.model.ema_scope():
             shape = [
                 16,
                 height // 16,
-                widht // 16,
+                width // 16,
             ]  # note: currently hardcoded for f16 model
             samples_ddim, _ = self.sampler.sample(
                 S=steps,
@@ -172,7 +209,7 @@ class Predictor(BasePredictor):
                 batch_size=sample_conditioning.shape[0],
                 shape=shape,
                 verbose=False,
-                unconditional_guidance_scale=scale,
+                unconditional_guidance_scale=prompt_scale,
                 unconditional_conditioning=uncond_clip_embed,
                 # eta=0.0,
             )
