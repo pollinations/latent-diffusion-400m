@@ -2,10 +2,6 @@ image: "r8.im/afiaka87/retrieval-augmented-diffusion"
 build:
   gpu: true
 
-  # system_packages:
-    # - "libgl1-mesa-glx"
-    # - "libglib2.0-0"
-
   # python version in the form '3.8' or '3.8.12'
   python_version: "3.8"
 
@@ -69,6 +65,7 @@ build:
     - webdataset==0.1.103
     - Werkzeug==2.1.2
     - x-clip==0.7.0
+    - clip-retrieval==2.34.0
   
   # commands run after the environment is setup
   run:
