@@ -5,13 +5,12 @@ import clip
 
 sys.path.append("src/taming-transformers")
 import tempfile
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
-from clip_retrieval.clip_back import (ParquetMetadataProvider, load_index,
-                                      meta_to_dict)
-from cog import BasePredictor, Input, Path
+from clip_retrieval.clip_back import ParquetMetadataProvider, load_index, meta_to_dict
+from cog import BasePredictor, Input, Path, BaseModel
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from PIL import Image
@@ -20,6 +19,10 @@ from torch import nn
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
 
+class Generation(BaseModel):
+    """Helper Output class for CodeGen. Allows for output to be markdown file or string."""
+    generations: List[Path]
+    relevant_metadata: Optional[List]
 
 @lru_cache(maxsize=None)  # cache the model, so we don't have to load it every time
 def load_clip(clip_model="ViT-L/14", use_jit=True, device="cpu"):
@@ -66,6 +69,7 @@ def load_model_from_config(config, ckpt, verbose=False):
     model.eval()
     return model
 
+
 # '["similarity","hash","punsafe","pwatermark","aesthetic","LANGUAGE"]
 def map_to_metadata(
     indices, distances, num_images, metadata_provider, columns_to_return=["url"]
@@ -88,8 +92,8 @@ def map_to_metadata(
 
 
 # TODO
-image_index_path = "data/rdm/searchers/LAION_Aesthetic_index/image.index"
-parquet_folder = "data/rdm/searchers/LAION_Aesthetic_index/other_metadata/"
+image_index_path = "data/rdm/searchers/laion2B-en-aesthetic-index/image.index"
+parquet_folder = "data/rdm/searchers/laion2B-en-aesthetic-index/metadata/"
 
 
 class Predictor(BasePredictor):
@@ -153,7 +157,7 @@ class Predictor(BasePredictor):
             description="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
         ),
         num_lookup_images: int = Input(
-            default=1,
+            default=20,
             description="The number of included neighbors in the knn search",
             ge=1,
             le=20,
@@ -165,23 +169,23 @@ class Predictor(BasePredictor):
         height: int = Input(default=768, description="image height, in pixel space"),
         width: int = Input(default=768, description="image width, in pixel space"),
         steps: int = Input(
-            default=250,
+            default=50,
             description="how many steps to run the model for",
         ),
-    ) -> List[Path]:
+    ) -> Generation:
         prompt_embedding = encode_text_with_clip_model(
             text=prompt, clip_model=self.clip_model, normalize=True
         )
         knn_distances, knn_indices, knn_embeddings = self.knn_search(
             prompt_embedding, num_lookup_images
         )
+
         relevant_metadata = map_to_metadata(
             indices=knn_indices,
             distances=knn_distances,
             num_images=num_lookup_images,
             metadata_provider=self.metadata_provider,
         )
-        print(relevant_metadata)
 
         sample_conditioning = torch.cat(
             [
@@ -214,18 +218,23 @@ class Predictor(BasePredictor):
                 # eta=0.0,
             )
             decoded_generations = self.model.decode_first_stage(samples_ddim)
-            decoded_generations = torch.clamp(
-                (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
-            )
+        decoded_generations = torch.clamp(
+            (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
+        )
 
-            generation_paths = []
-            for idx, generation in enumerate(decoded_generations):
-                generation = 255.0 * rearrange(
-                    generation.cpu().numpy(), "c h w -> h w c"
-                )
-                x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
-                x_sample_target_path = f"sample_{idx:03d}.png"  # TODO
-                pil_image = Image.fromarray(generation.astype(np.uint8))
-                pil_image.save(x_sample_target_path, "png")
-                generation_paths.append(Path(x_sample_target_path))
-        return generation_paths
+        generation_paths = []
+        for idx, generation in enumerate(decoded_generations):
+            generation = 255.0 * rearrange(
+                generation.cpu().numpy(), "c h w -> h w c"
+            )
+            x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
+            x_sample_target_path = f"sample_{idx:03d}.png"  # TODO
+            pil_image = Image.fromarray(generation.astype(np.uint8))
+            pil_image.save(x_sample_target_path, "png")
+            generation_paths.append(
+                Path(x_sample_target_path)
+            )
+        return Generation(
+            generations=generation_paths,
+            metadata=relevant_metadata,
+        )
