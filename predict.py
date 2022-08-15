@@ -1,186 +1,290 @@
-# Prediction interface for Cog ⚙️
-# https://github.com/replicate/cog/blob/main/docs/python.md
-
-from cog import BasePredictor, Input, Path
 import sys
-import cog
-# sys.path.append(".")
-# sys.path.append('./taming-transformers')
-from taming.models import vqgan 
-import torch
-from omegaconf import OmegaConf
 
-from ldm.util import instantiate_from_config
+sys.path.append("/taming-transformers")
+# sys.path.append("src/clip")
+import glob
+import os
+import tempfile
+import time
+from itertools import islice
+from multiprocessing import cpu_count
+from typing import Iterator, List, Union
 
-import argparse, os, sys, glob
-import torch
 import numpy as np
+import scann
+import torch
+import torch.nn as nn
+from cog import BasePredictor, Input, Path
+from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from PIL import Image
-from tqdm import tqdm, trange
-from einops import rearrange
 from torchvision.utils import make_grid
-import transformers
-import gc
-from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
-from open_clip import tokenizer
-import open_clip
-import argparse
+from tqdm import tqdm, trange
 
-import os
+from ldm.models.diffusion.plms import PLMSSampler
+from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
+from ldm.util import instantiate_from_config, parallel_data_prefetch
+
+
+class Searcher(object):
+    def __init__(self, database, retriever_version="ViT-L/14"):
+        assert database in DATABASES
+        # self.database = self.load_database(database)
+        self.database_name = database
+        self.searcher_savedir = f"data/rdm/searchers/{self.database_name}"
+        self.database_path = f"data/rdm/retrieval_databases/{self.database_name}"
+        self.retriever = self.load_retriever(version=retriever_version)
+        self.database = {"embedding": [], "img_id": [], "patch_coords": []}
+        self.load_database()
+        self.load_searcher()
+
+    def train_searcher(self, k, metric="dot_product", searcher_savedir=None):
+
+        print("Start training searcher")
+        searcher = scann.scann_ops_pybind.builder(
+            self.database["embedding"]
+            / np.linalg.norm(self.database["embedding"], axis=1)[:, np.newaxis],
+            k,
+            metric,
+        )
+        self.searcher = searcher.score_brute_force().build()
+        print("Finish training searcher")
+
+        if searcher_savedir is not None:
+            print(f'Save trained searcher under "{searcher_savedir}"')
+            os.makedirs(searcher_savedir, exist_ok=True)
+            self.searcher.serialize(searcher_savedir)
+
+    def load_single_file(self, saved_embeddings):
+        compressed = np.load(saved_embeddings)
+        self.database = {key: compressed[key] for key in compressed.files}
+        print("Finished loading of clip embeddings.")
+
+    def load_multi_files(self, data_archive):
+        out_data = {key: [] for key in self.database}
+        for d in tqdm(
+            data_archive,
+            desc=f"Loading datapool from {len(data_archive)} individual files.",
+        ):
+            for key in d.files:
+                out_data[key].append(d[key])
+
+        return out_data
+
+    def load_database(self):
+        print(f'Load saved patch embedding from "{self.database_path}"')
+        file_content = glob.glob(os.path.join(self.database_path, "*.npz"))
+
+        if len(file_content) == 1:
+            self.load_single_file(file_content[0])
+        elif len(file_content) > 1:
+            data = [np.load(f) for f in file_content]
+            prefetched_data = parallel_data_prefetch(
+                self.load_multi_files,
+                data,
+                n_proc=min(len(data), cpu_count()),
+                target_data_type="dict",
+            )
+
+            self.database = {
+                key: np.concatenate([od[key] for od in prefetched_data], axis=1)[0]
+                for key in self.database
+            }
+        else:
+            raise ValueError(
+                f'No npz-files in specified path "{self.database_path}" is this directory existing?'
+            )
+
+        print(
+            f'Finished loading of retrieval database of length {self.database["embedding"].shape[0]}.'
+        )
+
+    def load_retriever(
+        self,
+        version="ViT-L/14",
+    ):
+        model = FrozenClipImageEmbedder(model=version)
+        if torch.cuda.is_available():
+            model.cuda()
+        model.eval()
+        return model
+
+    def load_searcher(self):
+        print(
+            f"load searcher for database {self.database_name} from {self.searcher_savedir}"
+        )
+        self.searcher = scann.scann_ops_pybind.load_searcher(self.searcher_savedir)
+        print("Finished loading searcher.")
+
+    def search(self, x, k):
+        if self.searcher is None and self.database["embedding"].shape[0] < 2e4:
+            self.train_searcher(
+                k
+            )  # quickly fit searcher on the fly for small databases
+        assert self.searcher is not None, "Cannot search with uninitialized searcher"
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        if len(x.shape) == 3:
+            x = x[:, 0]
+        query_embeddings = x / np.linalg.norm(x, axis=1)[:, np.newaxis]
+
+        start = time.time()
+        nns, distances = self.searcher.search_batched(
+            query_embeddings, final_num_neighbors=k
+        )
+        end = time.time()
+
+        out_embeddings = self.database["embedding"][nns]
+        out_img_ids = self.database["img_id"][nns]
+        out_pc = self.database["patch_coords"][nns]
+
+        out = {
+            "nn_embeddings": out_embeddings
+            / np.linalg.norm(out_embeddings, axis=-1)[..., np.newaxis],
+            "img_ids": out_img_ids,
+            "patch_coords": out_pc,
+            "queries": x,
+            "exec_time": end - start,
+            "nns": nns,
+            "q_embeddings": query_embeddings,
+        }
+
+        return out
+
+    def __call__(self, x, n):
+        return self.search(x, n)
+
+
+DATABASES = [
+    "prompt_engineering",
+]
+
+
+def chunk(it, size):
+    it = iter(it)
+    return iter(lambda: tuple(islice(it, size)), ())
+
+
+def load_model_from_config(config, ckpt, verbose=False):
+    print(f"Loading model from {ckpt}")
+    pl_sd = torch.load(ckpt, map_location="cpu")
+    if "global_step" in pl_sd:
+        print(f"Global Step: {pl_sd['global_step']}")
+    sd = pl_sd["state_dict"]
+    model = instantiate_from_config(config.model)
+    m, u = model.load_state_dict(sd, strict=False)
+    if len(m) > 0 and verbose:
+        print("missing keys:")
+        print(m)
+    if len(u) > 0 and verbose:
+        print("unexpected keys:")
+        print(u)
+
+    model.cuda()
+    model.eval().half()
+    return model
 
 
 class Predictor(BasePredictor):
     def setup(self):
-        """Load the model into memory to make running multiple predictions efficient"""
-        clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
-        def load_model_from_config(config, ckpt, verbose=False):
-            print(f"Loading model from {ckpt}")
-            pl_sd = torch.load(ckpt, map_location="cuda:0")
-            sd = pl_sd["state_dict"]
-            model = instantiate_from_config(config.model)
-            m, u = model.load_state_dict(sd, strict=False)
-            if len(m) > 0 and verbose:
-                print("missing keys:")
-                print(m)
-            if len(u) > 0 and verbose:
-                print("unexpected keys:")
-                print(u)
+        self.device = (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        config = OmegaConf.load(f"configs/retrieval-augmented-diffusion/768x768.yaml")
+        model = load_model_from_config(config, f"/content/models/rdm/rdm768x768/model.ckpt")
+        self.model = model.to(self.device)
+        self.clip_text_encoder = FrozenCLIPTextEmbedder("ViT-L/14", device="cpu")
+        self.searcher = Searcher("prompt_engineering", retriever_version="ViT-L/14")
+        self.sampler = PLMSSampler(self.model)
+        self.outdir = Path(tempfile.mkdtemp())
 
-            model = model.half().cuda()
-            model.eval()
-            return model
-
-        config = OmegaConf.load("/latent-diffusion/configs/latent-diffusion/txt2img-1p4B-eval.yaml") 
-        model = load_model_from_config(config, "/content/models/ldm-model.ckpt") 
-
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        self.model = model.to(device)
-
+    @torch.inference_mode()
+    @torch.cuda.amp.autocast()
     def predict(
         self,
-        Prompt: str = cog.Input(description="Your text prompt.", default=""),
-        Steps: int = cog.Input(description="Number of steps to run the model", default=100),
-        ETA: int = cog.Input(description="Can be 0 or 1", default=1),
-        Samples_in_parallel: int = cog.Input(description="Batch size", default=4),
-        Diversity_scale: float = cog.Input(description="As a rule of thumb, higher values of scale produce better samples at the cost of a reduced output diversity.", default=10.),
-        Width: int = cog.Input(description="Width", default=256),
-        Height: int = cog.Input(description="Height", default=256)
-    ) -> None:
-        """Run a single prediction on the model"""
-        Prompts = Prompt
+        prompts: str = Input(
+            default="",
+            description="model will try to generate this text. use newlines to generate multiple prompts",
+        ),
+        ddim_steps: int = Input(
+            default=50, description="number of ddim sampling steps"
+        ),
+        ddim_eta: float = Input(
+            default=0.0,
+            description="ddim eta (eta=0.0 corresponds to deterministic sampling",
+        ),
+        H: int = Input(default=768, description="image height, in pixel space"),
+        W: int = Input(default=768, description="image width, in pixel space"),
+        n_samples: int = Input(
+            default=3,
+            description="how many samples to produce for each given prompt. A.k.a batch size",
+        ),
+        n_rows: int = Input(
+            default=0, description="rows in the grid (default: n_samples)"
+        ),
+        scale: float = Input(
+            default=5.0,
+            description="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
+        ),
+        knn: int = Input(
+            default=10,
+            description="The number of included neighbors, only applied when --use_neighbors=True",
+            ge=1,
+            le=20,
+        ),
+    ) -> List[Path]:
+        assert len(prompts) > 0, "no prompts provided"
 
-        Iterations = 1
-        output_path = "/outputs"
-        PLMS_sampling=True
+        # paths
+        n_rows = n_rows if n_rows > 0 else n_samples
+        print(f"sampling scale for cfg is {scale:.2f}")
 
-        
-        os.system(f"rm -rf /content/steps")
-        os.makedirs("/content/steps", exist_ok=True)
+        cond_clip_embed = self.clip_text_encoder.encode(prompts)
+        cond_clip_embed = cond_clip_embed.to(self.model.device)
 
-        frames = []
-        def save_img_callback(pred_x0, i):
-            # print(pred_x0)
-            frame_id = len(frames)
-            x_samples_ddim = self.model.decode_first_stage(pred_x0)
-            imgs = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
-            grid = imgs
-            #grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-            rows = len(imgs)
-            # check if rows is quadratic and if yes take the square root
-            height = int(rows**0.5)
-            grid = make_grid(imgs, nrow=height)
-            # to image
-            grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-            step_out = os.path.join("/content/steps", f'aaa_{frame_id:04}.png')
-            Image.fromarray(grid.astype(np.uint8)).save(step_out)
+        uncond_clip_embed = None
 
-            if frame_id % 10 == 0:
-                progress_out = os.path.join(output_path, "aaa_progress.png") 
-                Image.fromarray(grid.astype(np.uint8)).save(progress_out)
-            frames.append(frame_id)
-
-        def run(opt):
-            torch.cuda.empty_cache()
-            gc.collect()
-            if opt.plms:
-                opt.ddim_eta = 0
-                sampler = PLMSSampler(self.model)
-            else:
-                sampler = DDIMSampler(self.model)
-            
-            os.makedirs(opt.outdir, exist_ok=True)
-            outpath = opt.outdir
-
-            sample_path = os.path.join(outpath, "samples")
-            os.makedirs(sample_path, exist_ok=True)
-            base_count = len(os.listdir(sample_path))
-
-            all_samples=list()
-            samples_ddim, x_samples_ddim = None, None
-            with torch.no_grad():
-                with torch.cuda.amp.autocast():
-                    with self.model.ema_scope():
-                        uc = None
-                        if opt.scale > 0:
-                            uc = self.model.get_learned_conditioning(opt.n_samples * [""])
-                        for prompt in opt.prompts:
-                            print(prompt)
-                            for n in range(opt.n_iter):
-                                c = self.model.get_learned_conditioning(opt.n_samples * [prompt])
-                                shape = [4, opt.H//8, opt.W//8]
-                                samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                                conditioning=c,
-                                                                batch_size=opt.n_samples,
-                                                                shape=shape,
-                                                                verbose=False,
-                                                                img_callback=save_img_callback,
-                                                                unconditional_guidance_scale=opt.scale,
-                                                                unconditional_conditioning=uc,
-                                                                eta=opt.ddim_eta,
-                                                                x_T=samples_ddim)
-
-                                x_samples_ddim = self.model.decode_first_stage(samples_ddim)
-                                x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
-                                all_samples.append(x_samples_ddim)
-                # additionally, save as grid
-                grid = torch.stack(all_samples, 0)
-                grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                rows = opt.n_samples
-                # check if rows is quadratic and if yes take the square root
-                height = int(rows**0.5)
-                grid = make_grid(grid, nrow=height)
-                # to image
-                grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                #Image.fromarray(grid.astype(np.uint8)).save(os.path.join(outpath, f'zzz_{prompt.replace(" ", "-")}.png'))
-                # save individual images
-                for n,x_sample in enumerate(all_samples[0]):
-                    x_sample = x_sample.squeeze()
-                    x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                    prompt_filename = prompt.replace(" ", "-")
-                    Image.fromarray(x_sample.astype(np.uint8)).save(os.path.join(output_path, f"{output_path}/yyy_{prompt_filename}_{n}.png"))
-
-        os.system(f"rm {output_path}/aaa_*.png")
-
-        args = argparse.Namespace(
-            prompts = Prompts.split("->"), 
-            outdir=output_path,
-            ddim_steps = Steps,
-            ddim_eta = ETA,
-            n_iter = Iterations,
-            W=Width,
-            H=Height,
-            n_samples=Samples_in_parallel,
-            scale=Diversity_scale,
-            plms=PLMS_sampling
+        nn_dict = self.searcher(cond_clip_embed, knn)
+        sample_conditioning = torch.cat(
+            [
+                cond_clip_embed.to(self.device),
+                torch.from_numpy(nn_dict["nn_embeddings"]).to(self.device),
+            ],
+            dim=1,
         )
-        run(args)
+        if scale != 1.0:
+            # uncond_clip_embed = torch.zeros_like(cond_clip_embed)
+            uncond_clip_embed = torch.zeros_like(sample_conditioning)
 
-        # last_frame=!ls -w1 -t /content/steps/*.png | head -1
-        # last_frame = last_frame[0]
-        # !cp -v $last_frame /content/steps/aaa_0000.png
-        # !cp -v $last_frame /content/steps/aaa_0001.png
-        encoding_options = "-c:v libx264 -crf 20 -preset slow -vf format=yuv420p -c:a aac -movflags +faststart"
-        os.system(f"ffmpeg -y -r 10 -i /content/steps/aaa_%04d.png {encoding_options} {output_path}/zzz_output.mp4")
+        # TODO refactor to collect all samples in batches
+        with self.model.ema_scope():
+            shape = [
+                16,
+                H // 16,
+                W // 16,
+            ]  # note: currently hardcoded for f16 model
+            samples_ddim, _ = self.sampler.sample(
+                S=ddim_steps,
+                conditioning=sample_conditioning,
+                batch_size=cond_clip_embed.shape[0],
+                shape=shape,
+                verbose=True,
+                unconditional_guidance_scale=scale,
+                unconditional_conditioning=uncond_clip_embed,
+                eta=ddim_eta,
+            )
+            decoded_generations = self.model.decode_first_stage(samples_ddim)
+            decoded_generations = torch.clamp(
+                (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
+            )
+
+            generation_paths = []
+            for idx, generation in enumerate(decoded_generations):
+                generation = 255.0 * rearrange(
+                    generation.cpu().numpy(), "c h w -> h w c"
+                )
+                x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
+                pil_image = Image.fromarray(generation.astype(np.uint8))
+                pil_image.save(x_sample_target_path, "png")
+                generation_paths.append(Path(x_sample_target_path))
+        return generation_paths
