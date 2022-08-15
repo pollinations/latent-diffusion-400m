@@ -168,7 +168,7 @@ def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     else:
         embedding = repeat(timesteps, 'b -> b d', d=dim)
-    return embedding
+    return embedding.half()
 
 
 def zero_module(module):
@@ -213,7 +213,7 @@ class SiLU(nn.Module):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.half()).type(x.dtype).half()
 
 def conv_nd(dims, *args, **kwargs):
     """
