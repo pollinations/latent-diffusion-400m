@@ -202,7 +202,7 @@ class Predictor(BasePredictor):
             default=5.0,
             description="Determines influence of chosen database and your prompt on the generated image. Going above 5.0 is likely to cause artifacting.",
         ),
-        num_database_reuslts: int = Input(
+        num_database_results: int = Input(
             default=10,
             description="The number of search results to guide the generation with. Using more will 'broaden' capabilities of the model at the risk of causing mode collapse or artifacting.",
             ge=1,
@@ -231,7 +231,7 @@ class Predictor(BasePredictor):
         knn_distances, knn_indices, knn_embeddings = self.knn_search(
             self.searchers[database_name]["image_index"],
             prompt_embedding,
-            num_database_reuslts,
+            num_database_results,
         )
         if self.searchers[database_name]["metadata_provider"] is not None:
             search_results = map_to_metadata(
