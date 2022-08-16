@@ -30,6 +30,8 @@ DATABASES = [
     "artbench-renaissance",
     "artbench-surrealism",
     "artbench-ukiyo_e",
+    "simulacra",
+    "prompt_engineering",
 ]
 
 
