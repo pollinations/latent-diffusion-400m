@@ -19,11 +19,6 @@ from torch import nn
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
 
-# class Generation(BaseModel):
-#     """Helper Output class for CodeGen. Allows for output to be markdown file or string."""
-#     generations: List[Path]
-#     relevant_metadata: Optional[List]
-
 
 @lru_cache(maxsize=None)  # cache the model, so we don't have to load it every time
 def load_clip(clip_model="ViT-L/14", use_jit=True, device="cpu"):
@@ -95,11 +90,18 @@ def map_to_metadata(
 def build_searcher(database_name: str):
     image_index_path = Path(f"data/rdm/searchers/{database_name}/image.index")
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
+    print(f"Loading semantic index from {image_index_path}")
+
     metadata_path = Path(f"data/rdm/searchers/{database_name}/metadata")
     return {
-        "image_index": load_index(str(image_index_path), enable_faiss_memory_mapping=True),
-        "metadata_provider": ParquetMetadataProvider(str(metadata_path)) if metadata_path.exists() else None,
+        "image_index": load_index(
+            str(image_index_path), enable_faiss_memory_mapping=True
+        ),
+        "metadata_provider": ParquetMetadataProvider(str(metadata_path))
+        if metadata_path.exists()
+        else None,
     }
+
 
 class Predictor(BasePredictor):
     def __init__(self):
@@ -123,10 +125,28 @@ class Predictor(BasePredictor):
         self.sampler = PLMSSampler(self.model)
         print("Using PLMS sampler")
 
-        self.searchers = {}
-        self.searchers["laion-aesthetic"] = build_searcher("laion-aesthetic")
-        self.searchers["prompt-engineer"] = build_searcher("prompt-engineer")
-        self.searchers["simulacra"] = build_searcher("simulacra")
+        self.database_names = (
+            [  # TODO you have to copy this to the predict arg any time it is changed.
+                "cars",
+                "country211",
+                "faces",
+                "laion-aesthetic",
+                "pets",
+                "pokemon",
+                "simulacra",
+                "coco",
+                "emotes",
+                "food",
+                "openimages",
+                "pixelart",
+                "prompt-engineer",
+            ]
+        )
+
+        self.searchers = {
+            database_name: build_searcher(database_name)
+            for database_name in self.database_names
+        }
 
     @torch.no_grad()
     def knn_search(self, knn_index, query: torch.Tensor, num_results: int):
@@ -157,18 +177,27 @@ class Predictor(BasePredictor):
             default="",
             description="model will try to generate this text.",
         ),
-        prompt_scale: float = Input(
-            default=5.0,
-            description="Determines influence of the prompt on the generated image. Going above 5.0 is likely to cause artifacting.",
-        ),
         database_name: str = Input(
             default="laion-aesthetic",
-            description="Which database to use for the semantic search. Different databases have different capabilties.",
+            description="Which database to use for the semantic search. Different databases have different capabilities.",
             choices=[
-                "laion-aesthetic",
+                "cars",
+                "country211",
+                "faces",
+                "pets",
+                "pokemon",
                 "simulacra",
-                "prompt-engineer"
+                "coco",
+                "emotes",
+                "food",
+                "openimages",
+                "pixelart",
+                "prompt-engineer",
             ],
+        ),
+        database_scale: float = Input(
+            default=5.0,
+            description="Determines influence of chosen database and your prompt on the generated image. Going above 5.0 is likely to cause artifacting.",
         ),
         num_database_reuslts: int = Input(
             default=10,
@@ -177,11 +206,15 @@ class Predictor(BasePredictor):
             le=20,
         ),
         num_generations: int = Input(
-            default=4,
+            default=1,
             description="Number of images to generate. Using more will make generation take longer.",  # TODO
         ),
-        height: int = Input(default=768, description="Desired height of generated images."),
-        width: int = Input(default=768, description="Desired width of generated images."),
+        height: int = Input(
+            default=768, description="Desired height of generated images."
+        ),
+        width: int = Input(
+            default=768, description="Desired width of generated images."
+        ),
         steps: int = Input(
             default=50,
             description="How many steps to run the model for. Using more will make generation take longer. 50 tends to work well.",
@@ -221,7 +254,7 @@ class Predictor(BasePredictor):
                 sample_conditioning, "1 k d -> b k d", b=num_generations
             )
         uncond_clip_embed = None
-        if prompt_scale != 1.0:
+        if database_scale != 1.0:
             uncond_clip_embed = torch.zeros_like(sample_conditioning)
         with self.model.ema_scope():
             shape = [
@@ -235,7 +268,7 @@ class Predictor(BasePredictor):
                 batch_size=sample_conditioning.shape[0],
                 shape=shape,
                 verbose=False,
-                unconditional_guidance_scale=prompt_scale,
+                unconditional_guidance_scale=database_scale,
                 unconditional_conditioning=uncond_clip_embed,
                 # eta=0.0,
             )
