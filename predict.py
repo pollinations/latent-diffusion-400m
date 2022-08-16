@@ -184,6 +184,7 @@ class Predictor(BasePredictor):
             default="laion-aesthetic",
             description="Which database to use for the semantic search. Different databases have different capabilities.",
             choices=[
+                "none",
                 "prompt-engineer",
                 "cars",
                 "openimages",
@@ -230,30 +231,34 @@ class Predictor(BasePredictor):
         prompt_embedding = encode_text_with_clip_model(
             text=prompt, clip_model=self.clip_model, normalize=True, device=self.device
         )
-        knn_distances, knn_indices, knn_embeddings = self.knn_search(
-            query=prompt_embedding,
-            num_results=num_database_results,
-            database_name=database_name,
-        )
-        if self.searchers[database_name]["metadata_provider"] is not None:
-            search_results = map_to_metadata(
-                indices=knn_indices,
-                distances=knn_distances,
-                num_images=num_database_results,
-                metadata_provider=self.searchers[database_name]["metadata_provider"],
+        if database_name != "none":
+            knn_distances, knn_indices, knn_embeddings = self.knn_search(
+                query=prompt_embedding,
+                num_results=num_database_results,
+                database_name=database_name,
             )
-            for search_result in search_results:
-                print("-----------------------------------------------------")
-                print(f"caption: {search_result['caption']}")
-                print(f"url: {search_result['url']}")
-                print("-----------------------------------------------------")
-        sample_conditioning = torch.cat(
-            [
-                prompt_embedding.to(self.device),
-                knn_embeddings.to(self.device),
-            ],
-            dim=1,
-        )
+            if self.searchers[database_name]["metadata_provider"] is not None:
+                search_results = map_to_metadata(
+                    indices=knn_indices,
+                    distances=knn_distances,
+                    num_images=num_database_results,
+                    metadata_provider=self.searchers[database_name]["metadata_provider"],
+                )
+                for search_result in search_results:
+                    print("-----------------------------------------------------")
+                    print(f"caption: {search_result['caption']}")
+                    print(f"url: {search_result['url']}")
+                    print("-----------------------------------------------------")
+            sample_conditioning = torch.cat(
+                [
+                    prompt_embedding.to(self.device),
+                    knn_embeddings.to(self.device),
+                ],
+                dim=1,
+            )
+        else:
+            sample_conditioning = prompt_embedding.to(self.device)
+            
         if num_generations > 1:
             sample_conditioning = repeat(
                 sample_conditioning, "1 k d -> b k d", b=num_generations
