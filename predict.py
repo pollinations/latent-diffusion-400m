@@ -202,7 +202,7 @@ class Predictor(BasePredictor):
         ),
         prompt_scale: float = Input(
             default=5.0,
-            description="Determines influence of your prompt on generation. Increase to move away from the dataset and towards your prompt, decrease to move closer to the style of the dataset, with less emphasis on the prompt.",
+            description="Determines influence of your prompt on generation.",
         ),
         num_database_results: int = Input(
             default=10,
