@@ -1,168 +1,52 @@
 import sys
+from functools import lru_cache
 
-sys.path.append("/taming-transformers")
-# sys.path.append("src/clip")
-import glob
-import os
+import clip
+
+sys.path.append("src/taming-transformers")
 import tempfile
-import time
-from itertools import islice
-from multiprocessing import cpu_count
-from typing import Iterator, List, Union
+from typing import List, Optional
 
 import numpy as np
-import scann
 import torch
-import torch.nn as nn
-from cog import BasePredictor, Input, Path
+from clip_retrieval.clip_back import ParquetMetadataProvider, load_index, meta_to_dict
+from cog import BaseModel, BasePredictor, Input, Path
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
 from PIL import Image
-from torchvision.utils import make_grid
-from tqdm import tqdm, trange
+from torch import nn
 
 from ldm.models.diffusion.plms import PLMSSampler
-from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
-from ldm.util import instantiate_from_config, parallel_data_prefetch
+from ldm.util import instantiate_from_config
 
 
-class Searcher(object):
-    def __init__(self, database, retriever_version="ViT-L/14"):
-        assert database in DATABASES
-        # self.database = self.load_database(database)
-        self.database_name = database
-        self.searcher_savedir = f"data/rdm/searchers/{self.database_name}"
-        self.database_path = f"data/rdm/retrieval_databases/{self.database_name}"
-        self.retriever = self.load_retriever(version=retriever_version)
-        self.database = {"embedding": [], "img_id": [], "patch_coords": []}
-        self.load_database()
-        self.load_searcher()
-
-    def train_searcher(self, k, metric="dot_product", searcher_savedir=None):
-
-        print("Start training searcher")
-        searcher = scann.scann_ops_pybind.builder(
-            self.database["embedding"]
-            / np.linalg.norm(self.database["embedding"], axis=1)[:, np.newaxis],
-            k,
-            metric,
-        )
-        self.searcher = searcher.score_brute_force().build()
-        print("Finish training searcher")
-
-        if searcher_savedir is not None:
-            print(f'Save trained searcher under "{searcher_savedir}"')
-            os.makedirs(searcher_savedir, exist_ok=True)
-            self.searcher.serialize(searcher_savedir)
-
-    def load_single_file(self, saved_embeddings):
-        compressed = np.load(saved_embeddings)
-        self.database = {key: compressed[key] for key in compressed.files}
-        print("Finished loading of clip embeddings.")
-
-    def load_multi_files(self, data_archive):
-        out_data = {key: [] for key in self.database}
-        for d in tqdm(
-            data_archive,
-            desc=f"Loading datapool from {len(data_archive)} individual files.",
-        ):
-            for key in d.files:
-                out_data[key].append(d[key])
-
-        return out_data
-
-    def load_database(self):
-        print(f'Load saved patch embedding from "{self.database_path}"')
-        file_content = glob.glob(os.path.join(self.database_path, "*.npz"))
-
-        if len(file_content) == 1:
-            self.load_single_file(file_content[0])
-        elif len(file_content) > 1:
-            data = [np.load(f) for f in file_content]
-            prefetched_data = parallel_data_prefetch(
-                self.load_multi_files,
-                data,
-                n_proc=min(len(data), cpu_count()),
-                target_data_type="dict",
-            )
-
-            self.database = {
-                key: np.concatenate([od[key] for od in prefetched_data], axis=1)[0]
-                for key in self.database
-            }
-        else:
-            raise ValueError(
-                f'No npz-files in specified path "{self.database_path}" is this directory existing?'
-            )
-
-        print(
-            f'Finished loading of retrieval database of length {self.database["embedding"].shape[0]}.'
-        )
-
-    def load_retriever(
-        self,
-        version="ViT-L/14",
-    ):
-        model = FrozenClipImageEmbedder(model=version)
-        if torch.cuda.is_available():
-            model.cuda()
-        model.eval()
-        return model
-
-    def load_searcher(self):
-        print(
-            f"load searcher for database {self.database_name} from {self.searcher_savedir}"
-        )
-        self.searcher = scann.scann_ops_pybind.load_searcher(self.searcher_savedir)
-        print("Finished loading searcher.")
-
-    def search(self, x, k):
-        if self.searcher is None and self.database["embedding"].shape[0] < 2e4:
-            self.train_searcher(
-                k
-            )  # quickly fit searcher on the fly for small databases
-        assert self.searcher is not None, "Cannot search with uninitialized searcher"
-        if isinstance(x, torch.Tensor):
-            x = x.detach().cpu().numpy()
-        if len(x.shape) == 3:
-            x = x[:, 0]
-        query_embeddings = x / np.linalg.norm(x, axis=1)[:, np.newaxis]
-
-        start = time.time()
-        nns, distances = self.searcher.search_batched(
-            query_embeddings, final_num_neighbors=k
-        )
-        end = time.time()
-
-        out_embeddings = self.database["embedding"][nns]
-        out_img_ids = self.database["img_id"][nns]
-        out_pc = self.database["patch_coords"][nns]
-
-        out = {
-            "nn_embeddings": out_embeddings
-            / np.linalg.norm(out_embeddings, axis=-1)[..., np.newaxis],
-            "img_ids": out_img_ids,
-            "patch_coords": out_pc,
-            "queries": x,
-            "exec_time": end - start,
-            "nns": nns,
-            "q_embeddings": query_embeddings,
-        }
-
-        return out
-
-    def __call__(self, x, n):
-        return self.search(x, n)
+@lru_cache(maxsize=None)  # cache the model, so we don't have to load it every time
+def load_clip(clip_model="ViT-L/14", use_jit=True, device="cpu"):
+    clip_model, preprocess = clip.load(clip_model, device=device, jit=use_jit)
+    return clip_model, preprocess
 
 
-DATABASES = [
-    "prompt_engineering",
-]
+@torch.no_grad()
+def encode_text_with_clip_model(
+    text: str,
+    clip_model: nn.Module,
+    normalize: bool = True,
+    device: str = "cpu",
+):
+    assert text is not None and len(text) > 0, "must provide text"
+    tokens = clip.tokenize(text, truncate=True).to(device)
+    clip_text_embed = clip_model.encode_text(tokens).to(device)
+    if normalize:
+        clip_text_embed /= clip_text_embed.norm(dim=-1, keepdim=True)
+    if clip_text_embed.ndim == 2:
+        clip_text_embed = clip_text_embed[:, None, :]
+    return clip_text_embed
 
 
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
 
 
 def load_model_from_config(config, ckpt, verbose=False):
@@ -179,116 +63,231 @@ def load_model_from_config(config, ckpt, verbose=False):
     if len(u) > 0 and verbose:
         print("unexpected keys:")
         print(u)
-
-    model.cuda()
-    model.eval().half()
+    model.eval()
+    print(f"Loaded model from {ckpt}")
     return model
 
 
+def map_to_metadata(
+    indices, distances, num_images, metadata_provider, columns_to_return=["url"]
+):
+    results = []
+    metas = metadata_provider.get(indices[:num_images])
+    for key, (dist, ind) in enumerate(zip(distances, indices)):
+        output = {}
+        meta = None if key + 1 > len(metas) else metas[key]
+        # convert_metadata_to_base64(meta) # TODO
+        if meta is not None:
+            output.update(meta_to_dict(meta))
+        output["id"] = ind.item()
+        output["similarity"] = dist.item()
+        print(output)
+        results.append(output)
+    print(len(results))
+    return results
+
+
+def build_searcher(database_name: str):
+    image_index_path = Path(f"data/rdm/searchers/{database_name}/image.index")
+    assert image_index_path.exists(), f"database at {image_index_path} does not exist"
+    print(f"Loading semantic index from {image_index_path}")
+
+    metadata_path = Path(f"data/rdm/searchers/{database_name}/metadata")
+    return {
+        "image_index": load_index(
+            str(image_index_path), enable_faiss_memory_mapping=True
+        ),
+        "metadata_provider": ParquetMetadataProvider(str(metadata_path))
+        if metadata_path.exists()
+        else None,
+    }
+
+
 class Predictor(BasePredictor):
+    def __init__(self):
+        self.searchers = None
+
+    @torch.inference_mode()
     def setup(self):
         self.device = (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
+
         config = OmegaConf.load(f"configs/retrieval-augmented-diffusion/768x768.yaml")
-        model = load_model_from_config(config, f"/content/models/rdm/rdm768x768/model.ckpt")
+        model = load_model_from_config(config, f"models/rdm/rdm768x768/model.ckpt")
         self.model = model.to(self.device)
-        self.clip_text_encoder = FrozenCLIPTextEmbedder("ViT-L/14", device="cpu")
-        #self.searcher = Searcher("prompt_engineering", retriever_version="ViT-L/14")
+        print(f"Loaded 1.4M param Retrieval Augmented Diffusion model to {self.device}")
+
+        use_jit = self.device.type.startswith("cuda")
+        self.clip_model, _ = load_clip("ViT-L/14", use_jit=use_jit, device=self.device)
+        print(f"Loaded clip model ViT-L/14 to {self.device} with use_jit={use_jit}")
+
         self.sampler = PLMSSampler(self.model)
-        self.outdir = Path(tempfile.mkdtemp())
+        print("Using PLMS sampler")
+
+        self.database_names = (
+            [  # TODO you have to copy this to the predict arg any time it is changed.
+                "prompt-engineer",
+                "cars",
+                "openimages",
+                "faces",
+                "simulacra",
+                "coco",
+                "pixelart",
+                "food",
+                "country211",
+                "laion-aesthetic",
+                "vaporwave",
+                "pets",
+                "emotes",
+                "pokemon",
+            ]
+        )
+
+        self.searchers = {
+            database_name: build_searcher(database_name)
+            for database_name in self.database_names
+        }
+
+    @torch.no_grad()
+    def knn_search(self, query: torch.Tensor, num_results: int, database_name: str):
+        # TODO rewrite this method
+        print(f"Running knn search with {database_name}")
+        knn_index = self.searchers[database_name]["image_index"]
+        query = query.squeeze(0)
+        query = query.cpu().detach().numpy().astype("float32")
+        distances, indices, embeddings = knn_index.search_and_reconstruct(
+            query, num_results
+        )
+        results = indices[0]  # first element is a list of indices
+        nb_results = np.where(results == -1)[0]
+        if len(nb_results) > 0:
+            nb_results = nb_results[0]
+        else:
+            nb_results = len(results)
+        result_indices = results[:nb_results]
+        result_distances = distances[0][:nb_results]
+        result_embeddings = embeddings[0][:nb_results]
+        result_embeddings = torch.from_numpy(result_embeddings.astype("float32"))
+        result_embeddings /= result_embeddings.norm(dim=-1, keepdim=True)
+        result_embeddings = result_embeddings.unsqueeze(0)
+        return result_distances, result_indices, result_embeddings
 
     @torch.inference_mode()
-    @torch.cuda.amp.autocast()
     def predict(
         self,
-        prompts: str = Input(
+        prompt: str = Input(
             default="",
-            description="model will try to generate this text. use newlines to generate multiple prompts",
+            description="model will try to generate this text.",
         ),
-        ddim_steps: int = Input(
-            default=50, description="number of ddim sampling steps"
+        database_name: str = Input(
+            default="laion-aesthetic",
+            description="Which database to use for the semantic search. Different databases have different capabilities.",
+            choices=[
+                "prompt-engineer",
+                "cars",
+                "openimages",
+                "faces",
+                "simulacra",
+                "coco",
+                "pixelart",
+                "food",
+                "country211",
+                "laion-aesthetic",
+                "vaporwave",
+                "pets",
+                "emotes",
+                "pokemon",
+            ],
         ),
-        ddim_eta: float = Input(
-            default=0.0,
-            description="ddim eta (eta=0.0 corresponds to deterministic sampling",
-        ),
-        H: int = Input(default=768, description="image height, in pixel space"),
-        W: int = Input(default=768, description="image width, in pixel space"),
-        n_samples: int = Input(
-            default=3,
-            description="how many samples to produce for each given prompt. A.k.a batch size",
-        ),
-        n_rows: int = Input(
-            default=0, description="rows in the grid (default: n_samples)"
-        ),
-        scale: float = Input(
+        prompt_scale: float = Input(
             default=5.0,
-            description="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
+            description="Determines influence of your prompt on generation.",
         ),
-        knn: int = Input(
+        num_database_results: int = Input(
             default=10,
-            description="The number of included neighbors, only applied when --use_neighbors=True",
+            description="The number of search results to guide the generation with. Using more will 'broaden' capabilities of the model at the risk of causing mode collapse or artifacting.",
             ge=1,
             le=20,
         ),
-        use_search: bool = Input(default=False, description="Use searcher")
+        num_generations: int = Input(
+            default=1,
+            description="Number of images to generate. Using more will make generation take longer.",  # TODO
+        ),
+        height: int = Input(
+            default=768, description="Desired height of generated images."
+        ),
+        width: int = Input(
+            default=768, description="Desired width of generated images."
+        ),
+        steps: int = Input(
+            default=50,
+            description="How many steps to run the model for. Using more will make generation take longer. 50 tends to work well.",
+        ),
     ) -> List[Path]:
-        assert len(prompts) > 0, "no prompts provided"
+        self.outdir = Path(tempfile.mkdtemp())
 
-        # paths
-        n_rows = n_rows if n_rows > 0 else n_samples
-        print(f"sampling scale for cfg is {scale:.2f}")
-
-        cond_clip_embed = self.clip_text_encoder.encode(prompts)
-        cond_clip_embed = cond_clip_embed.to(self.model.device)
-
-        uncond_clip_embed = None
-
-        if use_search:
-            nn_dict = self.searcher(cond_clip_embed, knn)
-            sample_conditioning = torch.cat(
-                [
-                    cond_clip_embed.to(self.device),
-                    torch.from_numpy(nn_dict["nn_embeddings"]).to(self.device),
-                ],
-                dim=1,
+        prompt_embedding = encode_text_with_clip_model(
+            text=prompt, clip_model=self.clip_model, normalize=True, device=self.device
+        )
+        knn_distances, knn_indices, knn_embeddings = self.knn_search(
+            query=prompt_embedding,
+            num_results=num_database_results,
+            database_name=database_name,
+        )
+        if self.searchers[database_name]["metadata_provider"] is not None:
+            search_results = map_to_metadata(
+                indices=knn_indices,
+                distances=knn_distances,
+                num_images=num_database_results,
+                metadata_provider=self.searchers[database_name]["metadata_provider"],
             )
-        else:
-            sample_conditioning = cond_clip_embed.to(self.device)
-        if scale != 1.0:
-            # uncond_clip_embed = torch.zeros_like(cond_clip_embed)
+            for search_result in search_results:
+                print("-----------------------------------------------------")
+                print(f"caption: {search_result['caption']}")
+                print(f"url: {search_result['url']}")
+                print("-----------------------------------------------------")
+        sample_conditioning = torch.cat(
+            [
+                prompt_embedding.to(self.device),
+                knn_embeddings.to(self.device),
+            ],
+            dim=1,
+        )
+        if num_generations > 1:
+            sample_conditioning = repeat(
+                sample_conditioning, "1 k d -> b k d", b=num_generations
+            )
+        uncond_clip_embed = None
+        if prompt_scale != 1.0:
             uncond_clip_embed = torch.zeros_like(sample_conditioning)
-
-        # TODO refactor to collect all samples in batches
         with self.model.ema_scope():
             shape = [
                 16,
-                H // 16,
-                W // 16,
+                height // 16,
+                width // 16,
             ]  # note: currently hardcoded for f16 model
             samples_ddim, _ = self.sampler.sample(
-                S=ddim_steps,
+                S=steps,
                 conditioning=sample_conditioning,
-                batch_size=cond_clip_embed.shape[0],
+                batch_size=sample_conditioning.shape[0],
                 shape=shape,
-                verbose=True,
-                unconditional_guidance_scale=scale,
+                verbose=False,
+                unconditional_guidance_scale=prompt_scale,
                 unconditional_conditioning=uncond_clip_embed,
-                eta=ddim_eta,
+                # eta=0.0,
             )
             decoded_generations = self.model.decode_first_stage(samples_ddim)
-            decoded_generations = torch.clamp(
-                (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
-            )
+        decoded_generations = torch.clamp(
+            (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
+        )
 
-            generation_paths = []
-            for idx, generation in enumerate(decoded_generations):
-                generation = 255.0 * rearrange(
-                    generation.cpu().numpy(), "c h w -> h w c"
-                )
-                x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
-                pil_image = Image.fromarray(generation.astype(np.uint8))
-                pil_image.save(x_sample_target_path, "png")
-                generation_paths.append(Path(x_sample_target_path))
+        generation_paths = []
+        for idx, generation in enumerate(decoded_generations):
+            generation = 255.0 * rearrange(generation.cpu().numpy(), "c h w -> h w c")
+            x_sample_target_path = self.outdir.joinpath(f"sample_{idx:03d}.png")
+            pil_image = Image.fromarray(generation.astype(np.uint8))
+            pil_image.save(x_sample_target_path, "png")
+            pil_image.save(f"sample_{idx:03d}.png")
+            generation_paths.append(Path(x_sample_target_path))
         return generation_paths

@@ -1,0 +1,6 @@
+.vscode/
+data/
+models/
+__pycache__/
+data/rdm/
+.cog/
