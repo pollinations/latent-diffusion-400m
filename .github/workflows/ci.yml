@@ -66,7 +66,6 @@ jobs:
           docker tag image:test $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker inspect image:test > inspect.json
-          python .github/workflows/extract_openapi.py
           
       - uses: webfactory/ssh-agent@v0.5.4
         with:
@@ -80,7 +79,8 @@ jobs:
           git config --global user.email "ci@pollinations.ai"
           git config --global user.name "pollinations-ci"
           git clone git@github.com:pollinations/model-index.git
-          cd model-index && python add_image.py ${{ github.repository }} $ECR_REGISTRY/$ECR_REPOSITORY && cd ..
           mkdir -p  model-index/${{ github.repository }}
-          cp openapi.json model-index/${{ github.repository }}/openapi.json
+          cp meta.json model-index/${{ github.repository }}/meta.json
+          cp inspect.json model-index/${{ github.repository }}/incpect.json
+          cd model-index && python add_image.py ${{ github.repository }} $ECR_REGISTRY/$ECR_REPOSITORY && cd ..
           cd model-index && git add . && (git commit -m "Updated ${{ github.repository }}: ${{ github.event.head_commit.message }}" && git push) || echo "model index not updated"
