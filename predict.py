@@ -194,7 +194,7 @@ class Predictor(BasePredictor):
         model = load_model_from_config(config, f"/content/models/rdm/rdm768x768/model.ckpt")
         self.model = model.to(self.device)
         self.clip_text_encoder = FrozenCLIPTextEmbedder("ViT-L/14", device="cpu")
-        self.searcher = Searcher("prompt_engineering", retriever_version="ViT-L/14")
+        #self.searcher = Searcher("prompt_engineering", retriever_version="ViT-L/14")
         self.sampler = PLMSSampler(self.model)
         self.outdir = Path(tempfile.mkdtemp())
 
@@ -232,6 +232,7 @@ class Predictor(BasePredictor):
             ge=1,
             le=20,
         ),
+        use_search: bool = Input(default=False, description="Use searcher")
     ) -> List[Path]:
         assert len(prompts) > 0, "no prompts provided"
 
@@ -244,14 +245,17 @@ class Predictor(BasePredictor):
 
         uncond_clip_embed = None
 
-        nn_dict = self.searcher(cond_clip_embed, knn)
-        sample_conditioning = torch.cat(
-            [
-                cond_clip_embed.to(self.device),
-                torch.from_numpy(nn_dict["nn_embeddings"]).to(self.device),
-            ],
-            dim=1,
-        )
+        if use_search:
+            nn_dict = self.searcher(cond_clip_embed, knn)
+            sample_conditioning = torch.cat(
+                [
+                    cond_clip_embed.to(self.device),
+                    torch.from_numpy(nn_dict["nn_embeddings"]).to(self.device),
+                ],
+                dim=1,
+            )
+        else:
+            sample_conditioning = cond_clip_embed.to(self.device)
         if scale != 1.0:
             # uncond_clip_embed = torch.zeros_like(cond_clip_embed)
             uncond_clip_embed = torch.zeros_like(sample_conditioning)
