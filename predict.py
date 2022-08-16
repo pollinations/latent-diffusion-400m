@@ -150,8 +150,10 @@ class Predictor(BasePredictor):
         }
 
     @torch.no_grad()
-    def knn_search(self, knn_index, query: torch.Tensor, num_results: int):
+    def knn_search(self, query: torch.Tensor, num_results: int, database_name: str):
         # TODO rewrite this method
+        print(f"Running knn search with {database_name}")
+        knn_index = self.searchers[database_name]["image_index"]
         query = query.squeeze(0)
         query = query.cpu().detach().numpy().astype("float32")
         distances, indices, embeddings = knn_index.search_and_reconstruct(
@@ -198,9 +200,9 @@ class Predictor(BasePredictor):
                 "pokemon",
             ],
         ),
-        database_scale: float = Input(
+        prompt_scale: float = Input(
             default=5.0,
-            description="Determines influence of chosen database and your prompt on the generated image. Going above 5.0 is likely to cause artifacting.",
+            description="Determines influence of your prompt on generation. Increase to move away from the dataset and towards your prompt, decrease to move closer to the style of the dataset, with less emphasis on the prompt.",
         ),
         num_database_results: int = Input(
             default=10,
@@ -229,15 +231,15 @@ class Predictor(BasePredictor):
             text=prompt, clip_model=self.clip_model, normalize=True, device=self.device
         )
         knn_distances, knn_indices, knn_embeddings = self.knn_search(
-            self.searchers[database_name]["image_index"],
-            prompt_embedding,
-            num_database_results,
+            query=prompt_embedding,
+            num_results=num_database_results,
+            database_name=database_name,
         )
         if self.searchers[database_name]["metadata_provider"] is not None:
             search_results = map_to_metadata(
                 indices=knn_indices,
                 distances=knn_distances,
-                num_images=num_database_reuslts,
+                num_images=num_database_results,
                 metadata_provider=self.searchers[database_name]["metadata_provider"],
             )
             for search_result in search_results:
@@ -257,7 +259,7 @@ class Predictor(BasePredictor):
                 sample_conditioning, "1 k d -> b k d", b=num_generations
             )
         uncond_clip_embed = None
-        if database_scale != 1.0:
+        if prompt_scale != 1.0:
             uncond_clip_embed = torch.zeros_like(sample_conditioning)
         with self.model.ema_scope():
             shape = [
@@ -271,7 +273,7 @@ class Predictor(BasePredictor):
                 batch_size=sample_conditioning.shape[0],
                 shape=shape,
                 verbose=False,
-                unconditional_guidance_scale=database_scale,
+                unconditional_guidance_scale=prompt_scale,
                 unconditional_conditioning=uncond_clip_embed,
                 # eta=0.0,
             )
