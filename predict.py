@@ -65,7 +65,7 @@ def load_model_from_config(config, ckpt, verbose=False):
         print(u)
     model.eval()
     print(f"Loaded model from {ckpt}")
-    return model
+    return model.half()
 
 
 def map_to_metadata(
@@ -114,7 +114,7 @@ class Predictor(BasePredictor):
         )
 
         config = OmegaConf.load(f"configs/retrieval-augmented-diffusion/768x768.yaml")
-        model = load_model_from_config(config, f"models/rdm/rdm768x768/model.ckpt")
+        model = load_model_from_config(config, f"/content/models/rdm/rdm768x768/model.ckpt")
         self.model = model.to(self.device)
         print(f"Loaded 1.4M param Retrieval Augmented Diffusion model to {self.device}")
 
