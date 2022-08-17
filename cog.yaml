@@ -38,5 +38,6 @@ build:
     - wget -O /content/models/rdm/rdm768x768/model.ckpt https://ommer-lab.com/files/rdm/model.ckpt
     - pip install scann
     - pip install git+https://github.com/openai/CLIP.git
+    - pip install clip-retrieval==2.34.0
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"
