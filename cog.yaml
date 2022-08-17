@@ -40,7 +40,7 @@ build:
     - pip install git+https://github.com/openai/CLIP.git
     - pip install clip-retrieval==2.34.0
     - pip install gdown
-    - gdown --id 1BvNWNyQFXf0evsGwOtnhYCyX1uGALM31/
+    - gdown --id 1BvNWNyQFXf0evsGwOtnhYCyX1uGALM31
     - tar -xzvf rdm_data_laion_aesthetic.tar.gz
 
 # predict.py defines how predictions are run on your model
