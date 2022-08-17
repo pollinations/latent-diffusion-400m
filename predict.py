@@ -88,11 +88,11 @@ def map_to_metadata(
 
 
 def build_searcher(database_name: str):
-    image_index_path = Path(f"data/rdm/searchers/{database_name}/image.index")
+    image_index_path = Path(f"/data/rdm/searchers/{database_name}/image.index")
     assert image_index_path.exists(), f"database at {image_index_path} does not exist"
     print(f"Loading semantic index from {image_index_path}")
 
-    metadata_path = Path(f"data/rdm/searchers/{database_name}/metadata")
+    metadata_path = Path(f"/data/rdm/searchers/{database_name}/metadata")
     return {
         "image_index": load_index(
             str(image_index_path), enable_faiss_memory_mapping=True

@@ -41,6 +41,6 @@ build:
     - pip install clip-retrieval==2.34.0
     - pip install gdown
     - gdown --id 1sCmn4ze-7Mc18lob0HAiRxa2Pk_zqWM_
-    - tar -czvf rdm_data.tar.gz
+    - tar -xzvf rdm_data.tar.gz
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"
