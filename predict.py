@@ -50,7 +50,7 @@ def normalized(a, axis=-1, order=2):
 
 
 def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
+    print(f"--- Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
@@ -130,7 +130,7 @@ class Predictor(BasePredictor):
             [  # TODO you have to copy this to the predict arg any time it is changed.
                 "prompt-engineer",
                 "cars",
-                "openimages",
+                # "openimages",
                 "faces",
                 "simulacra",
                 "coco",
@@ -186,20 +186,7 @@ class Predictor(BasePredictor):
             description="Which database to use for the semantic search. Different databases have different capabilities.",
             choices=[
                 "none",
-                "prompt-engineer",
-                "cars",
-                "openimages",
-                "faces",
-                "simulacra",
-                "coco",
-                "pixelart",
-                "food",
-                "country211",
                 "laion-aesthetic",
-                "vaporwave",
-                "pets",
-                "emotes",
-                "pokemon",
             ],
         ),
         prompt_scale: float = Input(
