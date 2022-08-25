@@ -128,20 +128,7 @@ class Predictor(BasePredictor):
 
         self.database_names = (
             [  # TODO you have to copy this to the predict arg any time it is changed.
-                "prompt-engineer",
-                "cars",
-                # "openimages",
-                "faces",
-                "simulacra",
-                "coco",
-                "pixelart",
-                "food",
-                "country211",
                 "laion-aesthetic",
-                "vaporwave",
-                "pets",
-                "emotes",
-                "pokemon",
             ]
         )
 
@@ -182,7 +169,7 @@ class Predictor(BasePredictor):
             description="model will try to generate this text.",
         ),
         database_name: str = Input(
-            default="laion-aesthetic",
+            default="none",
             description="Which database to use for the semantic search. Different databases have different capabilities.",
             choices=[
                 "none",
