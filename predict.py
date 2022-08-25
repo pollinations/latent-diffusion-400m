@@ -128,7 +128,7 @@ class Predictor(BasePredictor):
 
         self.database_names = (
             [  # TODO you have to copy this to the predict arg any time it is changed.
-                "laion-aesthetic",
+            #    "laion-aesthetic",
             ]
         )
 
