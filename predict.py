@@ -9,7 +9,8 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from clip_retrieval.clip_back import ParquetMetadataProvider, load_index, meta_to_dict
+from clip_retrieval.clip_back import (ParquetMetadataProvider, load_index,
+                                      meta_to_dict)
 from cog import BaseModel, BasePredictor, Input, Path
 from einops import rearrange, repeat
 from omegaconf import OmegaConf
